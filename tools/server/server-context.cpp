@@ -3839,6 +3839,14 @@ private:
                             ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS ||
                             n_swa > 0);
 
+                    // make checkpoints only if the prompt is long enough
+                    // (avoids wasting memory on tiny prompts where the cost of
+                    //  a checkpoint exceeds its benefit; for recurrent/hybrid models
+                    //  the state size is constant regardless of prompt length)
+                    if (params_base.checkpoint_min_prompt > 0 && slot.prompt.n_tokens() < params_base.checkpoint_min_prompt) {
+                        do_checkpoint = false;
+                    }
+
                     bool has_mtmd = false;
 
                     // check if we should process the mtmd chunk
