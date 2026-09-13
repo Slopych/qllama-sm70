@@ -610,9 +610,10 @@ struct server_prompt_cache_state {
 };
 
 struct server_prompt_cache {
-    server_prompt_cache(int32_t limit_size_mib, size_t limit_tokens) {
+    server_prompt_cache(int32_t limit_size_mib, size_t limit_tokens, int32_t min_prompt_tokens) {
         this->limit_size   = 1024ull*1024ull*(limit_size_mib < 0 ? 0 : limit_size_mib);
         this->limit_tokens = limit_tokens;
+        this->min_prompt   = min_prompt_tokens;
     }
 
     std::list<server_prompt_cache_state> states;
@@ -622,6 +623,9 @@ struct server_prompt_cache {
 
     // in tokens, 0 = no limit
     size_t limit_tokens = 0;
+
+    // minimum prompt length to cache; 0 = no minimum (cache all)
+    int32_t min_prompt = 0;
 
     size_t size() const;
 
