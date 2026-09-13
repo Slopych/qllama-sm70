@@ -1,5 +1,21 @@
 <div align="center">
 
+# qllama-sm70
+
+**Форк sm70-attn с PR #25592 и собственными фиксами**
+
+Этот форк включает:
+- **PR #25592** — checkpoint handling for hybrid/recurrent models (ggml-org/llama.cpp)
+- **Собственный фикс** — `--checkpoint-min-prompt` — минимальная длина промпта для создания чекпоинтов, предотвращает кэширование мелких промптов
+
+Базовый форк: [sm70-attn](https://github.com/fishlikeX/sm70-attn)
+
+</div>
+
+---
+
+<div align="center">
+
 # sm70-attn
 
 **为 Tesla V100 重新点亮的 FlashAttention —— llama.cpp 深度定制分叉**
