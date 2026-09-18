@@ -631,6 +631,7 @@ struct common_params {
     int32_t checkpoint_min_step  = 8192;  // minimum spacing between context checkpoints
     int32_t checkpoint_min_prompt = 0;    // minimum prompt length (in tokens) before creating checkpoints; 0 = no minimum
     int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
+    bool    kv_admission        = false; // queue new tasks when KV budget is exhausted (unified KV)
 
     std::string hostname      = "127.0.0.1";
     std::string public_path   = "";                                                                         // NOLINT

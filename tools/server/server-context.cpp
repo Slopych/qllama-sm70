@@ -2709,6 +2709,38 @@ private:
                 cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
     }
 
+    // estimate the KV tokens a task will occupy: prompt + max output
+    // max output is the per-request n_predict, else the global default, else 8192
+    // for parent tasks the estimate also covers all child tasks
+    size_t kv_admission_needed(const server_task & task) const {
+        auto one_task = [&](const server_task & t) -> size_t {
+            int32_t max_output = 8192;
+            if (t.params.n_predict > 0) {
+                max_output = t.params.n_predict;
+            } else if (params_base.n_predict > 0) {
+                max_output = params_base.n_predict;
+            }
+            return (size_t) t.n_tokens() + (size_t) max_output;
+        };
+
+        size_t total = one_task(task);
+        for (const auto & child : task.child_tasks) {
+            total += one_task(child);
+        }
+        return total;
+    }
+
+    // total KV tokens currently held by active slots (unified KV is one shared pool)
+    size_t kv_admission_used() const {
+        size_t used = 0;
+        for (const auto & slot : slots) {
+            if (slot.is_processing()) {
+                used += slot.prompt.n_tokens();
+            }
+        }
+        return used;
+    }
+
     // returns false to decline the task, it is offered again after the decode is done
     bool process_single_task(server_task && task, bool is_yielding) {
         // while yielding, an encode / decode is running and only reading the server state is safe
@@ -2732,6 +2764,28 @@ private:
                     }
 
                     const int id_task = task.id;
+
+                    // admission control: queue the task if it would exceed the unified KV budget
+                    // note: only meaningful with a shared KV pool (unified KV); with per-slot
+                    //       partitions each slot owns its own budget, so there is no shared overflow
+                    if (params_base.kv_admission && params_base.kv_unified) {
+                        const size_t needed = kv_admission_needed(task);
+
+                        if (needed > (size_t) n_ctx) {
+                            // the task can never fit, even in an empty pool - reject immediately
+                            SRV_ERR("kv admission: task id_task = %d needs %zu tokens, KV budget is only %d, rejecting\n", id_task, needed, n_ctx);
+                            send_error(id_task, "Request context exceeds the available KV cache budget", ERROR_TYPE_INVALID_REQUEST);
+                            break;
+                        }
+
+                        const size_t used = kv_admission_used();
+                        if (used + needed > (size_t) n_ctx) {
+                            // defer the task; it is offered again once an active slot frees KV
+                            SRV_WRN("kv admission: task id_task = %d needs %zu tokens, KV used = %zu of %d, queuing\n", id_task, needed, used, n_ctx);
+                            queue_tasks.defer(std::move(task));
+                            break;
+                        }
+                    }
 
                     server_slot * slot = get_available_slot(task);
 

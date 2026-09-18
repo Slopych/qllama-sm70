@@ -7,6 +7,7 @@
 Этот форк включает:
 - **PR #25592** — checkpoint handling for hybrid/recurrent models (ggml-org/llama.cpp)
 - **Собственный фикс** — `--checkpoint-min-prompt` — минимальная длина промпта для создания чекпоинтов, предотвращает кэширование мелких промптов
+- **Собственный фикс** — `--kv-admission` — KV admission control: запрос, чей суммарный контекст (prompt + max output) превышает общий KV-бюджет, ставится в очередь вместо зависания сервера в retry-цикле (требует `--kv-unified`)
 
 Базовый форк: [sm70-attn](https://github.com/fishlikeX/sm70-attn)
 
@@ -125,6 +126,36 @@ server 的 slot save/restore 原本只持久化 target 的 KV 状态：重启后
 保存时写入最近 N 个检查点（target + draft + spec 三份状态 blob），恢复时
 自动校验并装回 slot 的 checkpoints 列表；实际装回数量同时受
 `--ctx-checkpoints`（内存上限）约束，取两者较小值。
+
+## KV admission control (`--kv-admission`)
+
+При `--kv-unified` все слоты делят один общий KV-пул (`--ctx-size`). Если
+суммарный контекст активных запросов + новый запрос (prompt + max output)
+превышает бюджет, stock-сервер запускает запрос, а затем зависает в цикле
+retry (см. upstream ggml-org#20050). С `--kv-admission` такой запрос
+отклоняется до запуска:
+
+- **Влезает** — запуск как обычно.
+- **Не влезает в текущий бюджет** — запрос ставится в очередь
+  (`queue_tasks.defer`) и повторно предлагается, как только активный слот
+  освободит KV.
+- **Не влезает никогда** (prompt + max output > n_ctx даже в пустой пул) —
+  немедленный отказ с ошибкой 400.
+
+max output берётся из per-request `n_predict`, иначе из глобального
+`--n-predict`, иначе 8192. Для parent-запроса оценка покрывает все child-запросы.
+
+```bash
+./build/bin/llama-server \
+    ... \
+    --kv-unified \
+    --kv-admission
+```
+
+| 参数 | 默认 | 说明 |
+|:---|:---:|:---|
+| `--kv-admission` / `--no-kv-admission` | 关 | очередь запросов при переполнении общего KV-бюджета (только с `--kv-unified`) |
+| `LLAMA_ARG_KV_ADMISSION` | `false` | переменная окружения, эквивалент `--kv-admission` |
 
 ## 环境变量
 
