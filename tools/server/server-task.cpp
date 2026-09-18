@@ -1843,6 +1843,9 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
     auto it_best = find_better(prompt, tokens_new);
 
     if (it_best != states.end()) {
+        // reward cache hit
+        it_best->prompt.score = std::min((uint8_t)(it_best->prompt.score + 1), (uint8_t)4);
+
         // Restore the cached state into the live context WITHOUT consuming the
         // cache entry. The previous behaviour freed the serialized bytes and
         // erased the entry on every match. That is wrong for an alternating
@@ -1896,11 +1899,44 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
 }
 
 void server_prompt_cache::update() {
+    // second-chance eviction: decay score and rotate to back, evict when score <= 1
+    auto evict_one = [this]() {
+        if (states.size() <= 1) {
+            return;
+        }
+
+        // hard iteration cap to prevent infinite loops when all entries have max score
+        const size_t max_iter = states.size() * 5;
+        size_t iter = 0;
+
+        while (states.size() > 1) {
+            if (iter++ >= max_iter) {
+                SRV_WRN(" - cache size limit reached, removing oldest entry (size = %.3f MiB)\n", states.front().size() / (1024.0 * 1024.0));
+                states.pop_front();
+                return;
+            }
+
+            if (states.front().prompt.score <= 1) {
+                // score has decayed, safe to evict
+                SRV_WRN(" - cache limit reached, evicting unused/decayed entry (size = %.3f MiB)\n",
+                        states.front().size() / (1024.0 * 1024.0));
+                states.pop_front();
+                return;
+            }
+
+            // second chance: decay score and rotate to back
+            states.front().prompt.score--;
+            states.splice(states.end(), states, states.begin());
+        }
+    };
+
     if (limit_size > 0) {
         while (!states.empty() && size() > limit_size) {
-            SRV_WRN(" - cache size limit reached, removing oldest entry (size = %.3f MiB)\n", states.front().size() / (1024.0 * 1024.0));
+            if (states.size() <= 1) {
+                break;
+            }
 
-            states.pop_front();
+            evict_one();
         }
     }
 
@@ -1912,10 +1948,11 @@ void server_prompt_cache::update() {
 
     if (limit_tokens > 0) {
         while (!states.empty() && n_tokens() > limit_tokens_cur) {
-            SRV_WRN(" - cache token limit (%zu, est: %zu) reached, removing oldest entry (size = %.3f MiB)\n",
-                    limit_tokens, limit_tokens_cur, states.front().size() / (1024.0 * 1024.0));
+            if (states.size() <= 1) {
+                break;
+            }
 
-            states.pop_front();
+            evict_one();
         }
     }
 
@@ -1923,7 +1960,7 @@ void server_prompt_cache::update() {
             states.size(), size() / (1024.0 * 1024.0), limit_size / (1024.0 * 1024.0), limit_tokens, limit_tokens_cur);
 
     for (const auto & state : states) {
-        SRV_TRC("   - prompt %p: %7d tokens, checkpoints: %2zu, %9.3f MiB\n",
-                (const void *)&state, state.prompt.n_tokens(), state.prompt.checkpoints.size(), state.size() / (1024.0 * 1024.0));
+        SRV_TRC("   - prompt %p: %7d tokens, checkpoints: %2zu, score: %u, %9.3f MiB\n",
+                (const void *)&state, state.prompt.n_tokens(), state.prompt.checkpoints.size(), state.prompt.score, state.size() / (1024.0 * 1024.0));
     }
 }
