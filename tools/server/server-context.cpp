@@ -3979,8 +3979,8 @@ private:
                             /* is_prompt = */ true);
                         slot.prompt.tokens.push_back(cur_tok);
 
-                        // break at the last user message, or at user messages at least min step past the last checkpoint
-                        if (do_checkpoint && spans.is_user_start(slot.prompt.n_tokens())) {
+                        // break at the last user message, or at fixed intervals at least min step past the last checkpoint
+                        if (do_checkpoint) {
                             const auto pos = slot.prompt.n_tokens();
                             const auto & checkpoints = slot.prompt.checkpoints;
 
@@ -4036,8 +4036,10 @@ private:
                         slot.init_sampler();
                     } else {
                         // skip ordinary mid-prompt checkpoints, unless the batch starts a user
-                        // message or we are near the end of the prompt
-                        if (!is_user_start && !near_prompt_end) {
+                        // message, we are near the end of the prompt, or this is an interval
+                        // checkpoint (at least min step past the last checkpoint)
+                        if (!is_user_start && !near_prompt_end && !slot.prompt.checkpoints.empty() &&
+                                n_tokens_start <= slot.prompt.checkpoints.back().n_tokens + params_base.checkpoint_min_step) {
                             do_checkpoint = false;
                         }
                     }
