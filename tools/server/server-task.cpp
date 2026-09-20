@@ -1740,6 +1740,40 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
         return nullptr;
     }
 
+    // collapse near-identical snapshots into the incoming one: an entry that
+    // shares almost the whole shorter prompt is a stale snapshot of the same
+    // conversation (divergent tails from sampled turns), not a separate one.
+    // replace it in place instead of letting it accumulate and evict entries
+    // that are actually in use
+    const float f_dup_thold = 0.99f;
+
+    for (auto it = states.begin(); it != states.end(); ++it) {
+        const size_t len_old = it->prompt.tokens.size();
+
+        if (len_old == 0) {
+            continue;
+        }
+
+        const int len_lcp = it->prompt.tokens.get_common_prefix(prompt.tokens);
+        const float f_dup = float(len_lcp) / float(std::min(len_old, prompt.tokens.size()));
+
+        if (f_dup >= f_dup_thold) {
+            SRV_TRC(" - replacing near-identical cached prompt (length %zu, lcp %d, f_dup %.3f)\n",
+                    len_old, len_lcp, f_dup);
+
+            // resize the buffers to the new state size; the caller writes the
+            // fresh KV state into them below (a stale entry may be shorter)
+            it->data.main.resize(state_size_main);
+            it->data.drft.resize(state_size_drft);
+
+            // keep the entry in place so its score and list position survive
+            it->prompt.tokens      = prompt.tokens.clone();
+            it->prompt.checkpoints = prompt.checkpoints;
+
+            return &(*it);
+        }
+    }
+
     // remove any cached prompts that are fully contained in the current prompt
     for (auto it = states.begin(); it != states.end();) {
         const int len = it->prompt.tokens.get_common_prefix(prompt.tokens);
