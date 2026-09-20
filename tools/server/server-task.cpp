@@ -1763,8 +1763,8 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
 
             // resize the buffers to the new state size; the caller writes the
             // fresh KV state into them below (a stale entry may be shorter)
-            it->data.main.resize(state_size_main);
-            it->data.drft.resize(state_size_drft);
+            it->data.main.resize(state_size_tgt);
+            it->data.drft.resize(state_size_dft);
 
             // keep the entry in place so its score and list position survive
             it->prompt.tokens      = prompt.tokens.clone();
