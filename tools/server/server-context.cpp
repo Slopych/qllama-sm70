@@ -1196,7 +1196,11 @@ private:
 
     llama_context * ctx_tgt = nullptr;
 
-    server_batch batch;
+    server_batch batch;        // decode graph: sampled/draft tokens of generating slots
+    server_batch batch_prefill;  // prefill graph: prompt tokens of started/processing slots
+    // the batch currently being evaluated; decode()/metrics_post_decode() read through it
+    // so a single pass of run_graph() can drive either graph without touching the member names
+    server_batch * active_batch = nullptr;
 
     llama_model   * model_dft = nullptr;
     llama_context * ctx_dft   = nullptr;
@@ -1659,6 +1663,7 @@ private:
             const int32_t n_batch = llama_n_batch(ctx_tgt);
             const int32_t n_embd  = llama_model_n_embd_inp(model_tgt);
             batch.init(std::max(n_batch, params_base.n_parallel), n_embd);
+            batch_prefill.init(std::max(n_batch, params_base.n_parallel), n_embd);
         }
 
         if (params_base.cache_ram_mib != 0) {
@@ -3237,6 +3242,7 @@ private:
             scoped_timer t(t_pre_decode, n_pre_decode);
             pre_decode();
             batch.render();
+            batch_prefill.render();
         } catch (const std::exception & e) {
             SRV_ERR("pre_decode() failed: %s\n", e.what());
             abort_all_slots("pre_decode() failed: " + std::string(e.what()));
@@ -3245,68 +3251,88 @@ private:
             return;
         }
 
-        GGML_ASSERT(batch.slot_batched || batch.size() == 0);
+        // run one graph over the given batch: set up the per-batch context,
+        // then evaluate it in n_batch chunks with decode()/post_decode()
+        // decode() and metrics_post_decode() read through active_batch,
+        // so the same pass drives both the decode and the prefill graph
+        auto run_graph = [&](server_batch & graph) {
+            GGML_ASSERT(graph.slot_batched || graph.size() == 0);
 
-        if (batch.slot_batched) {
-            auto & slot_batched      = batch.slot_batched;
-            auto & alora_scale       = batch.alora_scale;
-            auto & alora_disabled_id = batch.alora_disabled_id;
+            active_batch = &graph;
 
-            // TODO @ngxson : alora handling is too messy, need to refactor it to be more clear and maintainable
-            // apply lora, only need to do it once per batch
-            common_set_adapter_lora(ctx_tgt, slot_batched->lora);
+            if (graph.slot_batched) {
+                auto & slot_batched      = graph.slot_batched;
+                auto & alora_scale       = graph.alora_scale;
+                auto & alora_disabled_id = graph.alora_disabled_id;
 
-            // if the lora is temporarily disabled for an alora, re-enable it
-            // for next time
-            if (alora_scale > 0.0f) {
-                SRV_DBG("re-enabling alora with scale %f\n", alora_scale);
-                slot_batched->lora[alora_disabled_id].scale = alora_scale;
+                // TODO @ngxson : alora handling is too messy, need to refactor it to be more clear and maintainable
+                // apply lora, only need to do it once per batch
+                common_set_adapter_lora(ctx_tgt, slot_batched->lora);
+
+                // if the lora is temporarily disabled for an alora, re-enable it
+                // for next time
+                if (alora_scale > 0.0f) {
+                    SRV_DBG("re-enabling alora with scale %f\n", alora_scale);
+                    slot_batched->lora[alora_disabled_id].scale = alora_scale;
+                }
+
+                llama_set_embeddings(ctx_tgt, slot_batched->need_embd());
             }
 
-            llama_set_embeddings(ctx_tgt, slot_batched->need_embd());
-        }
+            llama_batch batch_view;
+            int32_t off_next = 0;
+            int32_t n_batch  = llama_n_batch(ctx_tgt);
+            for (int32_t off = 0; off < graph.size(); off = off_next) {
+                const int32_t n_tokens = std::min(n_batch, graph.size() - off);
+                try {
+                    scoped_timer t(t_decode, n_decode);
+                    // TODO @ngxson : maybe handle n_batch == 1 here instead of inside decode()
 
-        llama_batch batch_view;
-        int32_t off_next = 0;
-        int32_t n_batch = llama_n_batch(ctx_tgt);
-        for (int32_t off = 0; off < batch.size(); off = off_next) {
-            const int32_t n_tokens = std::min(n_batch, batch.size() - off);
-            try {
-                scoped_timer t(t_decode, n_decode);
-                // TODO @ngxson : maybe handle n_batch == 1 here instead of inside decode()
-
-                batch_view = batch.get_view(off, n_tokens);
-                bool ok = decode(n_batch, off, batch_view);
+                    batch_view = graph.get_view(off, n_tokens);
+                    bool ok = decode(n_batch, off, batch_view);
 #ifdef DEBUG_TIMINGS
-                llama_synchronize(ctx_tgt);
+                    llama_synchronize(ctx_tgt);
 #endif
 
-                if (ok) {
-                    // move the head of the batch forward with the number of tokens we just processed
-                    off_next = off + n_tokens;
+                    if (ok) {
+                        // move the head of the batch forward with the number of tokens we just processed
+                        off_next = off + n_tokens;
 
-                    // on successful decode, restore the original batch size
-                    n_batch = llama_n_batch(ctx_tgt);
-                } else {
-                    // try again with the updated n_batch
-                    continue;
+                        // on successful decode, restore the original batch size
+                        n_batch = llama_n_batch(ctx_tgt);
+                    } else {
+                        // try again with the updated n_batch
+                        continue;
+                    }
+                } catch (const std::exception & e) {
+                    SRV_ERR("decode() failed: %s\n", e.what());
+                    abort_all_slots("decode() failed: " + std::string(e.what()));
+                    break; // stop any further processing
                 }
-            } catch (const std::exception & e) {
-                SRV_ERR("decode() failed: %s\n", e.what());
-                abort_all_slots("decode() failed: " + std::string(e.what()));
-                break; // stop any further processing
+
+                try {
+                    scoped_timer t(t_post_decode, n_post_decode);
+                    post_decode(n_tokens, off, batch_view);
+                } catch (const std::exception & e) {
+                    SRV_ERR("post_decode() failed: %s\n", e.what());
+                    abort_all_slots("post_decode() failed: " + std::string(e.what()));
+                    break; // stop any further processing
+                }
             }
 
-            try {
-                scoped_timer t(t_post_decode, n_post_decode);
-                post_decode(n_tokens, off, batch_view);
-            } catch (const std::exception & e) {
-                SRV_ERR("post_decode() failed: %s\n", e.what());
-                abort_all_slots("post_decode() failed: " + std::string(e.what()));
-                break; // stop any further processing
-            }
-        }
+            active_batch = nullptr;
+        };
+
+        // decode graph first: generating slots get their token without waiting
+        // behind any prefill, so a prompt on one slot no longer stalls the
+        // decode of another (see the greedy-fill regression in #26022)
+        run_graph(batch);
+
+        // prefill graph second: prompt tokens run in their own graph at full
+        // n_batch efficiency, with no decode tokens mixed in
+        run_graph(batch_prefill);
     }
+
 
     void pre_decode() {
         // apply context-shift if needed
@@ -3373,8 +3399,9 @@ private:
             }
         });
 
-        // start populating the batch for this iteration
+        // start populating the batches for this iteration
         batch.clear();
+        batch_prefill.clear();
 
         // track if given slot can be batched with slots already in the batch
         auto & slot_batched = batch.slot_batched;
@@ -3506,15 +3533,17 @@ private:
         int32_t n_batch  = llama_n_batch(ctx_tgt);
         int32_t n_ubatch = llama_n_ubatch(ctx_tgt);
 
-        auto & alora_scale       = batch.alora_scale;
-        auto & alora_disabled_id = batch.alora_disabled_id;
+        auto & alora_scale       = batch_prefill.alora_scale;
+        auto & alora_disabled_id = batch_prefill.alora_disabled_id;
 
         // next, batch any pending prompts without exceeding n_batch
-        if (params_base.cont_batching || batch.size() == 0) {
+        if (params_base.cont_batching || batch_prefill.size() == 0) {
             bool add_ok = true; // false means the batch is full, skip remaining slots
 
+            auto & slot_prefill_batched = batch_prefill.slot_batched;
+
             iterate(slots, [&](server_slot & slot) {
-                if (!add_ok || batch.size() >= n_batch) {
+                if (!add_ok || batch_prefill.size() >= n_batch) {
                     return; // batch is full, skip remaining slots
                 }
 
@@ -3523,7 +3552,7 @@ private:
                 }
 
                 // check if we can batch this slot with the previous one
-                if (slot_batched && !slot_batched->can_batch_with(slot)) {
+                if (slot_prefill_batched && !slot_prefill_batched->can_batch_with(slot)) {
                     return;
                 }
 
@@ -3538,7 +3567,7 @@ private:
                     const auto & input_tokens = slot.task->tokens;
 
                     // used to determine the number of tokens added to the batch for the current slot
-                    const auto n_tokens_prev = batch.size();
+                    const auto n_tokens_prev = batch_prefill.size();
 
                     // TODO: maybe move branch to outside of this loop in the future
                     if (slot.state == SLOT_STATE_STARTED) {
@@ -3852,7 +3881,7 @@ private:
 
                     if (!slot.can_split()) {
                         // cannot fit the prompt in the current batch - will try next iter
-                        if (batch.size() + slot.task->n_tokens() > n_batch) {
+                        if (batch_prefill.size() + slot.task->n_tokens() > n_batch) {
                             return;
                         }
                     }
@@ -3954,7 +3983,7 @@ private:
                     const auto last_user_pos = spans.last_user_message_pos();
 
                     // add prompt tokens for processing in the current batch
-                    while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch) {
+                    while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch_prefill.size() < n_batch) {
                         // get next token to process
                         llama_token cur_tok = input_tokens[slot.prompt.n_tokens()];
                         if (cur_tok == LLAMA_TOKEN_NULL) {
@@ -3972,7 +4001,7 @@ private:
                         // embedding requires all tokens in the batch to be output;
                         // MTP also wants logits at every prompt position so the
                         // streaming hook can mirror t_h_nextn into ctx_dft.
-                        add_ok &= batch.add(slot.id,
+                        add_ok &= batch_prefill.add(slot.id,
                             cur_tok,
                             /* pos       = */ slot.prompt.tokens.pos_next(),
                             /* output    = */ slot.need_embd(),
@@ -4012,7 +4041,7 @@ private:
                     }
 
                     // the number of tokens added to the batch for the current slot
-                    const auto n_tokens_cur = batch.size() - n_tokens_prev;
+                    const auto n_tokens_cur = batch_prefill.size() - n_tokens_prev;
 
                     const auto n_tokens_start = slot.prompt.n_tokens() - n_tokens_cur;
 
@@ -4025,13 +4054,13 @@ private:
                     if (slot.prompt.n_tokens() == slot.task->n_tokens()) {
                         slot.state = SLOT_STATE_DONE_PROMPT;
 
-                        GGML_ASSERT(batch.size() > 0);
+                        GGML_ASSERT(batch_prefill.size() > 0);
 
                         // extract the logits only for the last token
-                        batch.set_output(batch.size() - 1, true);
+                        batch_prefill.set_output(batch_prefill.size() - 1, true);
 
                         slot.stats.n_gen = 0;
-                        slot.i_batch     = batch.size() - 1;
+                        slot.i_batch     = batch_prefill.size() - 1;
 
                         slot.init_sampler();
                     } else {
@@ -4070,8 +4099,8 @@ private:
                     }
                 }
 
-                if (!slot_batched) {
-                    slot_batched = &slot;
+                if (!slot_prefill_batched) {
+                    slot_prefill_batched = &slot;
                 }
             });
         }
@@ -4084,7 +4113,10 @@ private:
 
         metrics_pre_decode();
 
-        if (batch.size() == 0) {
+        // run_graph() sets active_batch to the graph currently being evaluated
+        auto & graph = *active_batch;
+
+        if (graph.size() == 0) {
             SRV_WRN("%s", "no tokens to decode\n");
 
             if (++n_empty_consecutive > 3) {
@@ -4098,7 +4130,7 @@ private:
 
         // TODO @ngxson : dft model may have different n_embd than the tgt model, so we check & reject if that's the case
         // this case is not currently used by any models, but may need to be supported in the future
-        if (spec && batch.has_embd) {
+        if (spec && graph.has_embd) {
             if (llama_model_n_embd_inp(model_dft) != llama_model_n_embd_inp(model_tgt)) {
                 SRV_ERR("%s", "unsupported batch.has_embd + spec case\n");
                 throw std::runtime_error("unsupported batch.has_embd + spec case");
@@ -4107,7 +4139,7 @@ private:
 
         bool has_output = false;
         for (int i = off; i < off + batch_view.n_tokens; ++i) {
-            has_output |= batch.tokens[i].output;
+            has_output |= graph.tokens[i].output;
         }
 
         // yield to the queue, so we can still handle metrics tasks while decoding
@@ -4504,6 +4536,9 @@ private:
 
     // has_output is computed by the caller, which also already synchronized the context if it is set
     void metrics_post_decode(int32_t off, int32_t n_tokens, bool has_output) {
+        // run_graph() sets active_batch to the graph currently being evaluated
+        auto & graph = *active_batch;
+
         metrics.n_decode++;
         for (const auto & slot : slots) {
             if (slot.is_processing()) {
@@ -4518,7 +4553,7 @@ private:
         uint64_t n_prompt_tokens = 0;
 
         for (int i = off; i < off + n_tokens; ++i) {
-            const auto & t = batch.tokens[i];
+            const auto & t = graph.tokens[i];
 
             if (!t.is_prompt) {
                 continue; // generated tokens are handled after sampling
@@ -4543,7 +4578,7 @@ private:
         // note: a second pass, it must run after the sync to reflect the compute
         const int64_t t_now = ggml_time_us();
         for (int i = off; i < off + n_tokens; ++i) {
-            const auto & t = batch.tokens[i];
+            const auto & t = graph.tokens[i];
             auto & slot = slots[t.id_slot];
             if (t.is_prompt && slot.stats.is_set()) {
                 slot.stats.set_prompt_last(t_now);
