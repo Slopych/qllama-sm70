@@ -2830,20 +2830,30 @@ private:
                         break; // drop the task
                     }
 
-                    if (params_base.cache_idle_slots) {
-                        for (auto & slot : slots) {
-                            if (!slot.is_processing()) {
+                    for (auto & slot : slots) {
+                        if (!slot.is_processing()) {
+                            // Publish the idle slot's state to the RAM prompt cache
+                            // only when idle-slot caching is enabled. get_available_slot()
+                            // already saves on reuse, so this per-task publication was the
+                            // redundant second save path that fed duplicate snapshots.
+                            if (params_base.cache_idle_slots) {
                                 SLT_TRC(slot, "%s", "saving idle slot to prompt cache\n");
 
                                 if (slot.prompt_save(*prompt_cache)) {
                                     SLT_DBG(slot, "%s", "__TEST_TAG_CACHE_IDLE_SLOT__\n");
                                     prompt_cache->update();
                                 }
+                            }
 
-                                if (params_base.kv_unified) {
-                                    // [TAG_IDLE_SLOT_CLEAR]
-                                    slot.prompt_clear();
-                                }
+                            // Always free the unified KV pool for idle slots. A finished
+                            // non-child slot keeps its cells pinned (release()/reset() do
+                            // not clear KV), and in a shared pool that leak starves the next
+                            // task: its restore/prefill fails to find free cells. The reused
+                            // slot is already processing by here, so only truly-idle slots
+                            // are freed.
+                            if (params_base.kv_unified) {
+                                // [TAG_IDLE_SLOT_CLEAR]
+                                slot.prompt_clear();
                             }
                         }
                     }
