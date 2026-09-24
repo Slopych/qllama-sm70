@@ -4097,10 +4097,14 @@ private:
                     if (do_checkpoint) {
                         create_checkpoint(slot, n_tokens_cur, pos_min, pos_max);
                     }
-                }
 
-                if (!slot_prefill_batched) {
-                    slot_prefill_batched = &slot;
+                    // track the first slot that added tokens to this batch,
+                    // so run_graph can set embeddings/lora from it; only set
+                    // if tokens were actually added, to keep slot_batched a
+                    // live reference to a slot with tokens in this batch
+                    if (n_tokens_cur > 0 && !slot_prefill_batched) {
+                        slot_prefill_batched = &slot;
+                    }
                 }
             });
         }
