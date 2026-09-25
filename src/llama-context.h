@@ -12,6 +12,7 @@
 #include "ggml-opt.h"
 
 #include <map>
+#include <unordered_set>
 #include <vector>
 
 struct llama_model;
@@ -56,6 +57,13 @@ struct llama_context {
     void sched_reserve();
 
     void synchronize();
+
+    // synchronize every backend touched by an in-flight state copy exactly once,
+    // instead of once per tensor. used to batch the per-tensor device<->host
+    // transfers of the sequence state copy (the hot path of the prompt-cache
+    // save/restore), which previously drained the GPU once per tensor and, with
+    // the up-front full-context sync, blocked every other slot's in-flight decode.
+    void synchronize_touched(const std::unordered_set<ggml_backend_t> & backends);
 
     const llama_model   & get_model()   const;
     const llama_cparams & get_cparams() const;

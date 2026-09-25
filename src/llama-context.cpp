@@ -19,6 +19,7 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <unordered_set>
 
 //
 // llama_context
@@ -745,6 +746,19 @@ void llama_context::synchronize() {
 
     n_queued_tokens = 0;
     t_compute_start_us = 0;
+}
+
+void llama_context::synchronize_touched(const std::unordered_set<ggml_backend_t> & backends) {
+    // one sync per backend touched by the state copy, instead of one sync per
+    // tensor (the per-tensor cudaStreamSynchronize in the non-async tensor
+    // get/set path dominated the copy time for a large KV state). only the
+    // backends that actually carried a transfer are synced, so backends with
+    // no pending work return immediately.
+    for (ggml_backend_t backend : backends) {
+        if (backend) {
+            ggml_backend_synchronize(backend);
+        }
+    }
 }
 
 const llama_model & llama_context::get_model() const {
@@ -2580,12 +2594,50 @@ private:
 class llama_io_write_host : public llama_io_write_i {
 public:
     llama_io_write_host(
-            uint8_t * p, size_t len) : ptr(p), buf_size(len) {}
+            uint8_t * p, size_t len, llama_context * ctx) : ptr(p), buf_size(len), ctx(ctx) {}
 
     ~llama_io_write_host() {
-        // TODO: add backend support to batch tensor_get? or some other way to speed this up
+        // resolve the owning backend of every tensor up front. if the scheduler
+        // owns all of them (the normal case for the KV cache), route the copies
+        // through the backend's async tensor API, which lands them on the
+        // backend's compute stream (stream-ordered after any in-flight compute),
+        // and synchronize each touched backend once at the end. this replaces
+        // the legacy path, which drained the whole context up front (blocking
+        // every other slot's in-flight decode) and then synced the GPU once per
+        // tensor -- tens of thousands of round-trips for a large KV state.
+        //
+        // if any tensor's backend cannot be resolved (the scheduler does not
+        // manage it), we cannot rely on stream ordering on the compute stream,
+        // so we fall back to the legacy behavior: a full drain up front plus the
+        // per-tensor (legacy-stream) synchronous copies. this preserves the old
+        // correctness guarantee for the rare non-scheduler-managed case.
+        bool all_resolved = true;
         for (const auto & winfo : winfos) {
-            ggml_backend_tensor_get(winfo.tensor, winfo.ptr, winfo.offset, winfo.size);
+            if (resolve_backend(winfo.tensor) == nullptr) {
+                all_resolved = false;
+                break;
+            }
+        }
+
+        if (all_resolved) {
+            for (const auto & winfo : winfos) {
+                ggml_backend_t backend = resolve_backend(winfo.tensor);
+                touched.insert(backend);
+                ggml_backend_tensor_get_async(backend, winfo.tensor, winfo.ptr, winfo.offset, winfo.size);
+            }
+            if (ctx) {
+                ctx->synchronize_touched(touched);
+            }
+        } else {
+            // legacy path: full drain (the copies ride the legacy per-thread
+            // stream, which is not ordered with the non-blocking compute stream),
+            // then the synchronous per-tensor copies.
+            if (ctx) {
+                ctx->synchronize();
+            }
+            for (const auto & winfo : winfos) {
+                ggml_backend_tensor_get(winfo.tensor, winfo.ptr, winfo.offset, winfo.size);
+            }
         }
     }
 
@@ -2628,16 +2680,75 @@ private:
         size_t offset;
     };
     std::vector<write_info> winfos;
+
+    // the owning context (for backend resolution + the batched sync). null when
+    // the io object is constructed without one (the legacy non-async path is
+    // then used, preserving the old behavior).
+    llama_context * ctx = nullptr;
+
+    // backends that received an async transfer; synced once at the end.
+    std::unordered_set<ggml_backend_t> touched;
+
+    // resolve the backend that owns a tensor (the same mapping the scheduler
+    // uses everywhere else in this file), so the device<->host transfer can be
+    // routed through that backend's async tensor API, which lands the copy on
+    // the backend's compute stream (stream-ordered after in-flight compute).
+    // returns null when the tensor's backend is unknown, in which case the
+    // caller falls back to the non-async path.
+    ggml_backend_t resolve_backend(ggml_tensor * tensor) const {
+        if (ctx == nullptr) {
+            return nullptr;
+        }
+        return ggml_backend_sched_get_tensor_backend(ctx->get_sched(), tensor);
+    }
 };
 
 class llama_io_read_host : public llama_io_read_i {
 public:
-    llama_io_read_host(const uint8_t * p, size_t len) : ptr(p), buf_size(len) {}
+    llama_io_read_host(const uint8_t * p, size_t len, llama_context * ctx = nullptr) : ptr(p), buf_size(len), ctx(ctx) {}
 
     ~llama_io_read_host() {
-        // flush the reads
+        // resolve the owning backend of every tensor up front. if the scheduler
+        // owns all of them (the normal case for the KV cache), route the copies
+        // through the backend's async tensor API, which lands them on the
+        // backend's compute stream (stream-ordered after any in-flight compute),
+        // and synchronize each touched backend once at the end. this replaces
+        // the legacy path, which drained the whole context up front (blocking
+        // every other slot's in-flight decode) and then synced the GPU once per
+        // tensor.
+        //
+        // if any tensor's backend cannot be resolved (the scheduler does not
+        // manage it), we cannot rely on stream ordering on the compute stream,
+        // so we fall back to the legacy behavior: a full drain up front plus the
+        // per-tensor (legacy-stream) synchronous copies (see the write_host
+        // destructor for the reasoning).
+        bool all_resolved = true;
         for (const auto & rinfo : rinfos) {
-            ggml_backend_tensor_set(rinfo.tensor, rinfo.ptr, rinfo.offset, rinfo.size);
+            if (resolve_backend(rinfo.tensor) == nullptr) {
+                all_resolved = false;
+                break;
+            }
+        }
+
+        if (all_resolved) {
+            for (const auto & rinfo : rinfos) {
+                ggml_backend_t backend = resolve_backend(rinfo.tensor);
+                touched.insert(backend);
+                ggml_backend_tensor_set_async(backend, rinfo.tensor, rinfo.ptr, rinfo.offset, rinfo.size);
+            }
+            if (ctx) {
+                ctx->synchronize_touched(touched);
+            }
+        } else {
+            // legacy path: full drain (the copies ride the legacy per-thread
+            // stream, which is not ordered with the non-blocking compute stream),
+            // then the synchronous per-tensor copies.
+            if (ctx) {
+                ctx->synchronize();
+            }
+            for (const auto & rinfo : rinfos) {
+                ggml_backend_tensor_set(rinfo.tensor, rinfo.ptr, rinfo.offset, rinfo.size);
+            }
         }
     }
 
@@ -2680,6 +2791,27 @@ private:
         size_t offset;
     };
     std::vector<read_info> rinfos;
+
+    // the owning context (for backend resolution + the batched sync). null when
+    // the io object is constructed without one (the legacy non-async path is
+    // then used, preserving the old behavior).
+    llama_context * ctx = nullptr;
+
+    // backends that received an async transfer; synced once at the end.
+    std::unordered_set<ggml_backend_t> touched;
+
+    // resolve the backend that owns a tensor (the same mapping the scheduler
+    // uses everywhere else in this file), so the device<->host transfer can be
+    // routed through that backend's async tensor API, which lands the copy on
+    // the backend's compute stream (stream-ordered after in-flight compute).
+    // returns null when the tensor's backend is unknown, in which case the
+    // caller falls back to the non-async path.
+    ggml_backend_t resolve_backend(ggml_tensor * tensor) const {
+        if (ctx == nullptr) {
+            return nullptr;
+        }
+        return ggml_backend_sched_get_tensor_backend(ctx->get_sched(), tensor);
+    }
 };
 
 class llama_io_write_file : public llama_io_write_i {
@@ -3045,7 +3177,7 @@ size_t llama_context::state_get_size() {
 }
 
 size_t llama_context::state_get_data(uint8_t * dst, size_t size) {
-    llama_io_write_host io(dst, size);
+    llama_io_write_host io(dst, size, this);
     try {
         return state_write_data(io);
     } catch (const std::exception & err) {
@@ -3055,7 +3187,7 @@ size_t llama_context::state_get_data(uint8_t * dst, size_t size) {
 }
 
 size_t llama_context::state_set_data(const uint8_t * src, size_t size) {
-    llama_io_read_host io(src, size);
+    llama_io_read_host io(src, size, this);
     try {
         return state_read_data(io);
     } catch (const std::exception & err) {
@@ -3084,7 +3216,7 @@ size_t llama_context::state_seq_get_data(llama_seq_id seq_id, uint8_t * dst, siz
     if (flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) {
         io = std::make_unique<llama_io_write_device>(dst, size, mem_storage[seq_id]);
     } else {
-        io = std::make_unique<llama_io_write_host>(dst, size);
+        io = std::make_unique<llama_io_write_host>(dst, size, this);
     }
 
     try {
@@ -3117,7 +3249,7 @@ size_t llama_context::state_seq_set_data(llama_seq_id seq_id, const uint8_t * sr
 
         io = std::make_unique<llama_io_read_device>(src, size, mem_storage[seq_id_read]);
     } else {
-        io = std::make_unique<llama_io_read_host>(src, size);
+        io = std::make_unique<llama_io_read_host>(src, size, this);
     }
 
     try {
@@ -4201,13 +4333,17 @@ size_t llama_state_seq_get_size_ext(llama_context * ctx, llama_seq_id seq_id, ll
 }
 
 size_t llama_state_seq_get_data_ext(llama_context * ctx, uint8_t * dst, size_t size, llama_seq_id seq_id, llama_state_seq_flags flags) {
-    ctx->synchronize();
-
+    // no full-context drain here: the device->host transfer is routed through
+    // the backend's async tensor API, which lands on the compute stream and is
+    // stream-ordered after any in-flight compute. the drain that used to happen
+    // up front is what stalled the other slots' in-flight decode when a slot
+    // swapped its KV cache out to RAM.
     return ctx->state_seq_get_data(seq_id, dst, size, flags);
 }
 size_t llama_state_seq_set_data_ext(llama_context * ctx, const uint8_t * src, size_t size, llama_seq_id seq_id, llama_state_seq_flags flags) {
-    ctx->synchronize();
-
+    // no full-context drain here: the host->device transfer is routed through
+    // the backend's async tensor API, which lands on the compute stream and is
+    // stream-ordered after any in-flight compute (see llama_state_seq_get_data_ext).
     return ctx->state_seq_set_data(seq_id, src, size, flags);
 }
 
