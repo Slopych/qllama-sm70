@@ -2793,6 +2793,33 @@ private:
                     }
 
                     const size_t kv_needed = kv_admission_needed(task);
+
+                    // Free the unified KV pool for idle slots BEFORE the slot is picked, so
+                    // the picked slot's prompt restore (inside get_available_slot) has room.
+                    // A finished slot pins its KV (release()/reset() do not clear it); in a
+                    // shared pool that pinning starves the next task's restore. Clear only
+                    // when the pool cannot fit the new task while idle slots keep their
+                    // cells, so under normal headroom the warm prefixes are preserved.
+                    if (params_base.kv_unified) {
+                        size_t kv_idle = 0;
+                        for (auto & slot : slots) {
+                            if (!slot.is_processing()) {
+                                kv_idle += slot.prompt.n_tokens();
+                            }
+                        }
+                        const bool kv_under_pressure =
+                            kv_admission_used() + kv_idle + kv_needed > (size_t) n_ctx;
+
+                        if (kv_under_pressure) {
+                            for (auto & idle_slot : slots) {
+                                if (!idle_slot.is_processing()) {
+                                    // [TAG_IDLE_SLOT_CLEAR]
+                                    idle_slot.prompt_clear();
+                                }
+                            }
+                        }
+                    }
+
                     server_slot * slot = get_available_slot(task);
 
                     //
@@ -2831,27 +2858,13 @@ private:
                         break; // drop the task
                     }
 
-                    // free the unified KV pool for idle slots only when the new task
-                    // cannot fit while they keep their cells. A finished slot pins its KV
-                    // (release()/reset() do not clear it), and in a shared pool that leak
-                    // starves the next task: its restore/prefill fails to find free cells.
-                    // when there is headroom, the idle slots stay warm so the next request
-                    // reuses the cached prefix instead of re-prefilling it.
-                    size_t kv_idle = 0;
-                    for (auto & slot : slots) {
-                        if (!slot.is_processing()) {
-                            kv_idle += slot.prompt.n_tokens();
-                        }
-                    }
-                    const bool kv_under_pressure = params_base.kv_unified &&
-                        kv_admission_used() + kv_idle + kv_needed > (size_t) n_ctx;
-
+                    // Publish the idle slots' state to the RAM prompt cache only when
+                    // idle-slot caching is enabled. get_available_slot() already saves the
+                    // picked slot on reuse, so this per-task publication was the redundant
+                    // second save path. The unified KV pool is freed up front (before the
+                    // slot is picked) so the picked slot's prompt restore has room.
                     for (auto & idle_slot : slots) {
                         if (!idle_slot.is_processing()) {
-                            // Publish the idle slot's state to the RAM prompt cache
-                            // only when idle-slot caching is enabled. get_available_slot()
-                            // already saves on reuse, so this per-task publication was the
-                            // redundant second save path that fed duplicate snapshots.
                             if (params_base.cache_idle_slots) {
                                 SLT_TRC(idle_slot, "%s", "saving idle slot to prompt cache\n");
 
@@ -2859,11 +2872,6 @@ private:
                                     SLT_DBG(idle_slot, "%s", "__TEST_TAG_CACHE_IDLE_SLOT__\n");
                                     prompt_cache->update();
                                 }
-                            }
-
-                            if (kv_under_pressure) {
-                                // [TAG_IDLE_SLOT_CLEAR]
-                                idle_slot.prompt_clear();
                             }
                         }
                     }
