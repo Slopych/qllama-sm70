@@ -2769,29 +2769,17 @@ private:
 
                     const int id_task = task.id;
 
-                    const size_t kv_needed = kv_admission_needed(task);
-
-                    // A finished slot pins its KV (release()/reset() do not clear it). In the
-                    // shared unified pool that pinning starves the next task: its restore /
-                    // prefill cannot find free cells. Free idle slots BEFORE admission so the
-                    // check sees the real pool. Clear only when the pool cannot fit the new
-                    // task while idle slots keep their cells, so under normal headroom the warm
-                    // prefixes are preserved.
-                    if (params_base.kv_unified && kv_admission_used() + kv_needed > (size_t) n_ctx) {
-                        for (auto & idle_slot : slots) {
-                            if (!idle_slot.is_processing()) {
-                                // [TAG_IDLE_SLOT_CLEAR]
-                                idle_slot.prompt_clear();
-                            }
-                        }
-                    }
-
-                    // admission control: queue the task if it would exceed the unified KV budget
-                    // note: only meaningful with a shared KV pool (unified KV); with per-slot
-                    //       partitions each slot owns its own budget, so there is no shared overflow
-                    // kv_admission_used() counts ALL slots (idle included), so after the clear
-                    // above it reflects the real available pool
+                    // KV admission: a single gate that both decides whether the task fits
+                    // and, when the pool is under pressure, frees the KV pinned by idle
+                    // slots to make room. Idle slots pin their KV (release()/reset() do not
+                    // clear it), so in the shared unified pool they starve the next task.
+                    // When the task does not fit, save each idle slot to the RAM cache
+                    // before clearing it, so the context can be restored later instead of
+                    // being lost. With kv_admission/kv_unified disabled this block is
+                    // skipped entirely and the standard slot-selection path is used.
                     if (params_base.kv_admission && params_base.kv_unified) {
+                        const size_t kv_needed = kv_admission_needed(task);
+
                         if (kv_needed > (size_t) n_ctx) {
                             // the task can never fit, even in an empty pool - reject immediately
                             SRV_ERR("kv admission: task id_task = %d needs %zu tokens, KV budget is only %d, rejecting\n", id_task, kv_needed, n_ctx);
@@ -2799,12 +2787,41 @@ private:
                             break;
                         }
 
-                        const size_t used = kv_admission_used();
+                        size_t used = kv_admission_used();
+
                         if (used + kv_needed > (size_t) n_ctx) {
-                            // defer the task; it is offered again once an active slot frees KV
-                            SRV_WRN("kv admission: task id_task = %d needs %zu tokens, KV used = %zu of %d, queuing\n", id_task, kv_needed, used, n_ctx);
-                            queue_tasks.defer(std::move(task));
-                            break;
+                            // the pool is under pressure - try to free the KV pinned by idle slots
+                            size_t used_if_cleared = 0;
+                            for (auto & slot : slots) {
+                                if (slot.is_processing()) {
+                                    used_if_cleared += slot.prompt.n_tokens();
+                                }
+                            }
+
+                            if (used_if_cleared + kv_needed <= (size_t) n_ctx) {
+                                bool saved_any = false;
+                                for (auto & idle_slot : slots) {
+                                    if (!idle_slot.is_processing() && idle_slot.prompt.n_tokens() > 0) {
+                                        // [TAG_IDLE_SLOT_SAVE]
+                                        if (params_base.cache_idle_slots) {
+                                            saved_any |= idle_slot.prompt_save(*prompt_cache);
+                                        }
+                                        // [TAG_IDLE_SLOT_CLEAR]
+                                        idle_slot.prompt_clear();
+                                    }
+                                }
+                                if (saved_any) {
+                                    prompt_cache->update();
+                                }
+                                used = used_if_cleared;
+                            }
+
+                            if (used + kv_needed > (size_t) n_ctx) {
+                                // even after freeing idle slots the task does not fit - defer
+                                SRV_WRN("kv admission: task id_task = %d needs %zu tokens, KV used = %zu of %d, queuing\n", id_task, kv_needed, used, n_ctx);
+                                queue_tasks.defer(std::move(task));
+                                break;
+                            }
                         }
                     }
 
